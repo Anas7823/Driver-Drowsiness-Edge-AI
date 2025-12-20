@@ -34,5 +34,5 @@ Driver-Drowsiness-TRM/
 ├── notebook.ipynb         # Pipeline complet (Data, Train, Eval)
 ├── app.py                 # Application Frontend (Streamlit)
 ├── requirements.txt       # Dépendances Python
-└── README.md              # Documentation
-│   best_trm_model.pth     # Le meilleur modèle entraîné (Apparait après l'entraînement)
+├── README.md              # Documentation
+└── best_trm_model.pth     # Le meilleur modèle entraîné (Apparait après l'entraînement)
