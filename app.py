@@ -126,7 +126,7 @@ st.title("🚗 Driver Drowsiness & Distraction Detection (TRM)")
 st.sidebar.header("Configuration")
 
 # Chargement du modèle
-model_path = "./models/best_trm_model_colab_0.97.pth" # Assurez-vous que le fichier est à côté de app.py
+model_path = "best_trm_model.pth" # Assurez-vous que le fichier est à côté de app.py
 model = load_model(model_path)
 
 if model is None:
