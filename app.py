@@ -21,58 +21,108 @@ CONFIG = {
     'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
 
-class TinyVisualEmbedding(nn.Module):
+# --- REMPLACEMENT DES CLASSES ---
+
+class SpatialVisualEmbedding(nn.Module):
+    """
+    Encodeur qui conserve la dimension spatiale (4x4 patches) 
+    au lieu de tout aplatir. Permet l'attention.
+    (Code provenant du notebook)
+    """
     def __init__(self, output_dim):
         super().__init__()
         self.features = nn.Sequential(
+            # Étape 1 : 64x64 -> 32x32 (Sortie 32 canaux)
             nn.Conv2d(3, 32, 3, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU6(),
+            
+            # Étape 2 : 32x32 -> 16x16 (Sortie 64 canaux)
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU6(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(64, output_dim)
+            
+            # Étape 3 : 16x16 -> 8x8 (Sortie output_dim canaux)
+            nn.Conv2d(64, output_dim, 3, stride=2, padding=1),
+            nn.BatchNorm2d(output_dim),
+            nn.ReLU6(),
+            
+            # Force une grille de 4x4 (16 tokens) peu importe la taille d'entrée
+            nn.AdaptiveAvgPool2d((4, 4)) 
         )
+    
     def forward(self, x):
-        return self.features(x)
+        # Sortie: [Batch, Dim, 4, 4] -> Flatten -> [Batch, Dim, 16] -> Permute -> [Batch, 16, Dim]
+        x = self.features(x)
+        B, C, H, W = x.shape
+        x = x.view(B, C, -1).permute(0, 2, 1) 
+        return x
 
-class TRMBlock(nn.Module):
-    def __init__(self, embed_dim, num_classes):
+class AttentionTRMBlock(nn.Module):
+    """
+    Bloc récursif utilisant le Self-Attention (Transformer).
+    (Code provenant du notebook)
+    """
+    def __init__(self, embed_dim, num_classes, num_heads=4):
         super().__init__()
-        input_dim = embed_dim + embed_dim + num_classes
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, embed_dim * 2),
-            nn.LayerNorm(embed_dim * 2),
+        # Couche d'attention
+        self.attn_norm = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads=num_heads, batch_first=True)
+        
+        # Réseau Feed-Forward
+        self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
             nn.Linear(embed_dim * 2, embed_dim)
         )
+        
+        # Tête de classification (Moyenne des patches)
         self.head = nn.Linear(embed_dim, num_classes)
 
-    def forward(self, x_feat, z_prev, y_prev_probs):
-        combined = torch.cat([x_feat, z_prev, y_prev_probs], dim=1)
-        z_new = self.net(combined)
-        y_logits = self.head(z_new)
-        y_probs = F.softmax(y_logits, dim=1)
-        return z_new, y_logits, y_probs
+    def forward(self, x_feat, z_prev):
+        # 1. Fusion de l'Input visuel et du Raisonnement précédent
+        z_curr = z_prev + x_feat
+        
+        # 2. Self-Attention : Le modèle compare les patches entre eux
+        z_norm = self.attn_norm(z_curr)
+        attn_out, _ = self.attn(z_norm, z_norm, z_norm)
+        z_curr = z_curr + attn_out # Connexion résiduelle
+        
+        # 3. Feed-Forward
+        z_curr = z_curr + self.ffn(self.ffn_norm(z_curr))
+        
+        # 4. Prédiction : On fait la moyenne des 16 patches pour décider
+        z_pooled = z_curr.mean(dim=1) 
+        y_logits = self.head(z_pooled)
+        
+        return z_curr, y_logits
 
 class DriverTRM(nn.Module):
+    """
+    Classe principale mise à jour pour utiliser l'Attention.
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.embedding = TinyVisualEmbedding(config['embed_dim'])
-        self.trm_block = TRMBlock(config['embed_dim'], config['num_classes'])
+        # Utilisation des nouveaux blocs définis ci-dessus
+        self.embedding = SpatialVisualEmbedding(config['embed_dim'])
+        self.trm_block = AttentionTRMBlock(config['embed_dim'], config['num_classes'])
         
     def forward(self, img):
-        batch_size = img.size(0)
+        # x_feat est maintenant une séquence : [Batch, 16, Dim]
         x_feat = self.embedding(img)
-        z_curr = torch.zeros(batch_size, self.config['embed_dim']).to(img.device)
-        y_curr_probs = torch.ones(batch_size, self.config['num_classes']).to(img.device) / self.config['num_classes']
+        
+        # z_curr est aussi une séquence (mémoire spatiale)
+        z_curr = torch.zeros_like(x_feat).to(img.device)
+        
         outputs_list = []
+        
+        # Boucle de Raisonnement Récursif
         for _ in range(self.config['recursion_depth']):
-            z_curr, y_logits, y_curr_probs = self.trm_block(x_feat, z_curr, y_curr_probs)
+            z_curr, y_logits = self.trm_block(x_feat, z_curr)
             outputs_list.append(y_logits)
+            
         return outputs_list
 
 # ==========================================
