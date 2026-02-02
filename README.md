@@ -7,6 +7,14 @@
 
 Un système de surveillance conducteur (DMS) ultra-léger conçu pour tourner sur des architectures Edge (Raspberry Pi, Jetson Nano). Ce projet remplace les lourds réseaux de neurones classiques (VGG, ResNet + LSTM) par une approche innovante : le **Tiny Recursive Model (TRM)**.
 
+## 📜 Table of Contents
+* [🧠 Pourquoi le TRM ? (Concept Scientifique)](#--pourquoi-le-trm--concept-scientifique)
+* [🎯 Fonctionnalités](#--fonctionnalités)
+* [📂 Structure du Projet](#--structure-du-projet)
+* [⚙️ Installation](#️-installation)
+* [🚀 Usage](#-usage)
+* [🤝 Contributing](#-contributing)
+
 ## 🧠 Pourquoi le TRM ? (Concept Scientifique)
 
 Ce projet est une implémentation appliquée du papier de recherche *"Less is More: Recursive Reasoning with Tiny Networks"*.
@@ -35,4 +43,39 @@ Driver-Drowsiness-TRM/
 ├── app.py                 # Application Frontend (Streamlit)
 ├── requirements.txt       # Dépendances Python
 ├── README.md              # Documentation
-└── best_trm_model.pth     # Le meilleur modèle entraîné (Apparait après l'entraînement)
+└── best_trm_model.pth     # Le meilleur modèle entraîné
+```
+
+## ⚙️ Installation
+
+1. **Clonez le dépôt :**
+   ```bash
+   git clone https://github.com/votre-nom/Driver-Drowsiness-TRM.git
+   cd Driver-Drowsiness-TRM
+   ```
+
+2. **Créez un environnement virtuel (recommandé) :**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Sur Windows: .venv\Scripts\activate
+   ```
+
+3. **Installez les dépendances :**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## 🚀 Usage
+
+Lancez l'application Streamlit avec la commande suivante :
+
+```bash
+streamlit run app.py
+```
+
+Ouvrez votre navigateur et allez à l'adresse `http://localhost:8501`.
+
+## 🤝 Contributing
+
+Les contributions sont les bienvenues ! Si vous avez des idées d'amélioration ou des corrections de bugs, n'hésitez pas à ouvrir une *issue* ou une *pull request*.
+
