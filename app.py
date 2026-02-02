@@ -7,123 +7,98 @@ from PIL import Image
 import cv2
 import numpy as np
 import tempfile
+import torchvision.models as models
 
 # ==========================================
-# 1. DÉFINITION DE L'ARCHITECTURE (Nécesaire pour charger le .pth)
+# 1. DÉFINITION DE L'ARCHITECTURE (Doit correspondre au notebook)
 # ==========================================
 
-# Configuration (Doit matcher celle de l'entraînement)
+# Configuration de l'entraînement
 CONFIG = {
-    'img_size': 64,
+    'img_size': 224,
     'embed_dim': 128,
     'num_classes': 3,
-    'recursion_depth': 4,
+    'recursion_depth': 3,
     'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
 
-# --- REMPLACEMENT DES CLASSES ---
+# --- Architecture du notebook (MobileNetV3 + Attention) ---
 
-class SpatialVisualEmbedding(nn.Module):
-    """
-    Encodeur qui conserve la dimension spatiale (4x4 patches) 
-    au lieu de tout aplatir. Permet l'attention.
-    (Code provenant du notebook)
-    """
+class PretrainedVisualEmbedding(nn.Module):
     def __init__(self, output_dim):
         super().__init__()
-        self.features = nn.Sequential(
-            # Étape 1 : 64x64 -> 32x32 (Sortie 32 canaux)
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(),
+        weights = models.MobileNet_V3_Small_Weights.DEFAULT
+        self.backbone = models.mobilenet_v3_small(weights=weights)
+        self.features = self.backbone.features
+        
+        for param in self.features.parameters():
+            param.requires_grad = False # Geler les poids pour l'inférence
             
-            # Étape 2 : 32x32 -> 16x16 (Sortie 64 canaux)
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(),
-            
-            # Étape 3 : 16x16 -> 8x8 (Sortie output_dim canaux)
-            nn.Conv2d(64, output_dim, 3, stride=2, padding=1),
+        self.adapter = nn.Sequential(
+            nn.Conv2d(576, output_dim, 1),
             nn.BatchNorm2d(output_dim),
-            nn.ReLU6(),
-            
-            # Force une grille de 4x4 (16 tokens) peu importe la taille d'entrée
-            nn.AdaptiveAvgPool2d((4, 4)) 
+            nn.ReLU6()
         )
-    
+        self.pool = nn.AdaptiveAvgPool2d((8, 8))
+
     def forward(self, x):
-        # Sortie: [Batch, Dim, 4, 4] -> Flatten -> [Batch, Dim, 16] -> Permute -> [Batch, 16, Dim]
         x = self.features(x)
+        x = self.adapter(x)
+        x = self.pool(x)
         B, C, H, W = x.shape
-        x = x.view(B, C, -1).permute(0, 2, 1) 
+        x = x.view(B, C, -1).permute(0, 2, 1)
         return x
 
 class AttentionTRMBlock(nn.Module):
-    """
-    Bloc récursif utilisant le Self-Attention (Transformer).
-    (Code provenant du notebook)
-    """
-    def __init__(self, embed_dim, num_classes, num_heads=4):
+    def __init__(self, embed_dim, num_classes, num_heads=4, attn_dropout=0.0):
         super().__init__()
-        # Couche d'attention
         self.attn_norm = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads=num_heads, batch_first=True)
-        
-        # Réseau Feed-Forward
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads=num_heads, 
+                                          dropout=attn_dropout, batch_first=True)
         self.ffn_norm = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
             nn.Linear(embed_dim * 2, embed_dim)
         )
-        
-        # Tête de classification (Moyenne des patches)
         self.head = nn.Linear(embed_dim, num_classes)
+        self.gate = nn.Parameter(torch.tensor([2.0])) 
 
-    def forward(self, x_feat, z_prev):
-        # 1. Fusion de l'Input visuel et du Raisonnement précédent
-        z_curr = z_prev + x_feat
-        
-        # 2. Self-Attention : Le modèle compare les patches entre eux
+    def forward(self, tokens, z_prev):
+        g = torch.sigmoid(self.gate) 
+        z_curr = z_prev + g * tokens
         z_norm = self.attn_norm(z_curr)
-        attn_out, _ = self.attn(z_norm, z_norm, z_norm)
-        z_curr = z_curr + attn_out # Connexion résiduelle
-        
-        # 3. Feed-Forward
+        attn_out, attn_weights = self.attn(z_norm, z_norm, z_norm, average_attn_weights=False)
+        z_curr = z_curr + attn_out
         z_curr = z_curr + self.ffn(self.ffn_norm(z_curr))
-        
-        # 4. Prédiction : On fait la moyenne des 16 patches pour décider
-        z_pooled = z_curr.mean(dim=1) 
-        y_logits = self.head(z_pooled)
-        
-        return z_curr, y_logits
+        cls_tok = z_curr[:, 0, :] 
+        y_logits = self.head(cls_tok)
+        return z_curr, y_logits, attn_weights
 
 class DriverTRM(nn.Module):
-    """
-    Classe principale mise à jour pour utiliser l'Attention.
-    """
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # Utilisation des nouveaux blocs définis ci-dessus
-        self.embedding = SpatialVisualEmbedding(config['embed_dim'])
-        self.trm_block = AttentionTRMBlock(config['embed_dim'], config['num_classes'])
+        self.embed_dim = config['embed_dim']
+        self.H = self.W = 8
+        self.embedding = PretrainedVisualEmbedding(self.embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.H*self.W, self.embed_dim))
+        self.trm_block = AttentionTRMBlock(self.embed_dim, config['num_classes'])
         
     def forward(self, img):
-        # x_feat est maintenant une séquence : [Batch, 16, Dim]
+        B = img.size(0)
         x_feat = self.embedding(img)
-        
-        # z_curr est aussi une séquence (mémoire spatiale)
-        z_curr = torch.zeros_like(x_feat).to(img.device)
-        
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        tokens = torch.cat([cls_tokens, x_feat], dim=1)
+        tokens = tokens + self.pos_embed
+        z_curr = torch.zeros_like(tokens).to(img.device)
         outputs_list = []
-        
-        # Boucle de Raisonnement Récursif
+        last_attn = None
         for _ in range(self.config['recursion_depth']):
-            z_curr, y_logits = self.trm_block(x_feat, z_curr)
+            z_curr, y_logits, last_attn = self.trm_block(tokens, z_curr)
             outputs_list.append(y_logits)
-            
-        return outputs_list
+        return outputs_list, last_attn
 
 # ==========================================
 # 2. FONCTIONS UTILITAIRES
@@ -133,41 +108,45 @@ class DriverTRM(nn.Module):
 def load_model(model_path):
     try:
         model = DriverTRM(CONFIG)
-        # map_location permet de charger sur CPU si pas de CUDA disponible
         model.load_state_dict(torch.load(model_path, map_location=CONFIG['device']))
         model.to(CONFIG['device'])
         model.eval()
         return model
     except FileNotFoundError:
         return None
+    except Exception as e:
+        st.error(f"Erreur lors du chargement du modèle : {e}")
+        st.error("Assurez-vous que l'architecture dans `app.py` correspond à celle du modèle entraîné.")
+        return None
+
 
 def get_preprocessing():
-    # Mêmes transformations que pour la validation
+    # Transformations pour la validation/inférence (doit correspondre au notebook)
     return T.Compose([
-        T.Resize((64, 64)),
+        T.Resize((CONFIG['img_size'], CONFIG['img_size'])),
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
 def predict_frame(model, frame_rgb, transform):
-    # Conversion numpy -> PIL -> Tensor
     pil_img = Image.fromarray(frame_rgb)
     img_tensor = transform(pil_img).unsqueeze(0).to(CONFIG['device'])
     
     with torch.no_grad():
-        outputs = model(img_tensor)
-        final_output = outputs[-1] # Dernière étape du TRM
+        # Le modèle du notebook retourne (outputs_list, last_attn)
+        outputs, _ = model(img_tensor)
+        final_output = outputs[-1] # On prend la dernière prédiction
         probs = F.softmax(final_output, dim=1)
         score, pred = torch.max(probs, 1)
         
     return pred.item(), score.item(), probs[0].cpu().numpy()
 
-# Classes
+# Classes et couleurs
 CLASSES = {0: "ALERT (Normal)", 1: "DROWSY (Somnolent)", 2: "DISTRACTED (Distrait)"}
-COLORS = {0: (0, 255, 0), 1: (255, 0, 0), 2: (0, 0, 255)} # RGB pour affichage
+COLORS = {0: (0, 255, 0), 1: (255, 0, 0), 2: (0, 0, 255)} # BGR pour OpenCV
 
 # ==========================================
-# 3. INTERFACE STREAMLIT
+# 3. INTERFACE STREAMLIT (inchangée)
 # ==========================================
 
 st.set_page_config(page_title="Driver Monitor AI", layout="wide")
@@ -176,7 +155,7 @@ st.title("🚗 Driver Drowsiness & Distraction Detection (TRM)")
 st.sidebar.header("Configuration")
 
 # Chargement du modèle
-model_path = "best_trm_model.pth" # Assurez-vous que le fichier est à côté de app.py
+model_path = "best_trm_model.pth"
 model = load_model(model_path)
 
 if model is None:
@@ -185,57 +164,40 @@ if model is None:
 else:
     st.sidebar.success("Modèle TRM chargé avec succès !")
 
-# Choix du mode
 mode = st.sidebar.radio("Choisissez une source :", ("🖼️ Image", "🎥 Vidéo", "📷 Webcam (Live)"))
 
 transform = get_preprocessing()
 
-# --- MODE IMAGE ---
 if mode == "🖼️ Image":
     uploaded_file = st.file_uploader("Uploader une image", type=['jpg', 'png', 'jpeg'])
-    
-    if uploaded_file is not None:
+    if uploaded_file:
         col1, col2 = st.columns(2)
-        
         image = Image.open(uploaded_file).convert('RGB')
         
         with col1:
             st.image(image, caption="Image originale", use_container_width=True)
             
-        # Inférence
-        img_tensor = transform(image).unsqueeze(0).to(CONFIG['device'])
-        with torch.no_grad():
-            outputs = model(img_tensor)
-            probs = F.softmax(outputs[-1], dim=1)
-            score, pred = torch.max(probs, 1)
-            
-        class_idx = pred.item()
+        pred_idx, score, probs = predict_frame(model, np.array(image), transform)
         
         with col2:
             st.subheader("Résultat")
-            if class_idx == 0:
+            if pred_idx == 0:
                 st.success(f"**{CLASSES[0]}**")
-            elif class_idx == 1:
+            elif pred_idx == 1:
                 st.error(f"**{CLASSES[1]}**")
             else:
                 st.warning(f"**{CLASSES[2]}**")
-                
-            st.metric("Confiance", f"{score.item():.2%}")
-            
-            st.write("Détails des probabilités :")
-            st.bar_chart({k: v for k, v in zip(CLASSES.values(), probs[0].cpu().numpy())})
+            st.metric("Confiance", f"{score:.2%}")
+            st.bar_chart({k: v for k, v in zip(CLASSES.values(), probs)})
 
-# --- MODE VIDÉO ---
 elif mode == "🎥 Vidéo":
     uploaded_video = st.file_uploader("Uploader une vidéo", type=['mp4', 'avi', 'mov'])
-    
-    if uploaded_video is not None:
+    if uploaded_video:
         tfile = tempfile.NamedTemporaryFile(delete=False) 
         tfile.write(uploaded_video.read())
         
         cap = cv2.VideoCapture(tfile.name)
         st_frame = st.image([])
-        
         stop_button = st.button("Arrêter la vidéo")
         
         while cap.isOpened() and not stop_button:
@@ -243,24 +205,19 @@ elif mode == "🎥 Vidéo":
             if not ret:
                 break
             
-            # OpenCV est BGR, on convertit en RGB pour le modèle et l'affichage
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
             pred_idx, conf, _ = predict_frame(model, frame_rgb, transform)
             
-            # Dessin sur l'image
+            # Affichage sur l'image (OpenCV utilise BGR)
             label_text = f"{CLASSES[pred_idx]} ({conf:.0%})"
-            color = COLORS[pred_idx]
+            color_bgr = tuple(reversed(COLORS[pred_idx])) # Convertir RGB en BGR pour OpenCV
+            cv2.putText(frame, label_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color_bgr, 3)
             
-            cv2.putText(frame_rgb, label_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 
-                        1, color, 2)
-            
-            # Affichage dans Streamlit
-            st_frame.image(frame_rgb, caption="Analyse vidéo TRM", use_container_width=True)
+            st_frame.image(frame, channels="BGR", caption="Analyse vidéo TRM")
             
         cap.release()
+        tfile.close()
 
-# --- MODE WEBCAM ---
 elif mode == "📷 Webcam (Live)":
     st.write("L'analyse se fera en temps réel sur le flux de votre webcam.")
     run = st.checkbox('Activer la Webcam')
@@ -268,7 +225,7 @@ elif mode == "📷 Webcam (Live)":
     FRAME_WINDOW = st.image([])
     
     if run:
-        cap = cv2.VideoCapture(0) # 0 est l'index par défaut de la webcam
+        cap = cv2.VideoCapture(0)
         
         while run:
             ret, frame = cap.read()
@@ -276,24 +233,20 @@ elif mode == "📷 Webcam (Live)":
                 st.error("Erreur d'accès à la webcam")
                 break
                 
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pred_idx, conf, _ = predict_frame(model, frame_rgb, transform)
             
-            # Inférence TRM
-            pred_idx, conf, probs_array = predict_frame(model, frame, transform)
-            
-            # Affichage Overlay
             label = CLASSES[pred_idx]
-            color = COLORS[pred_idx]
+            color_bgr = tuple(reversed(COLORS[pred_idx]))
             
-            cv2.putText(frame, f"{label}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
-            cv2.putText(frame, f"Conf: {conf:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(frame, f"{label}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color_bgr, 3)
+            cv2.putText(frame, f"Conf: {conf:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_bgr, 2)
             
-            # Barre latérale dynamique
             with st.sidebar:
                 st.markdown(f"### État actuel : **{label}**")
                 st.progress(int(conf * 100))
             
-            FRAME_WINDOW.image(frame)
+            FRAME_WINDOW.image(frame, channels="BGR")
         
         cap.release()
     else:
