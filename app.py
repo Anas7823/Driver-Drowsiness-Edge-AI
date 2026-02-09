@@ -227,6 +227,10 @@ elif mode == "📷 Webcam (Live)":
     if run:
         cap = cv2.VideoCapture(0)
         
+        with st.sidebar:
+            st_status = st.empty()
+            st_bar = st.empty()
+        
         try:
             while run:
                 ret, frame = cap.read()
@@ -243,9 +247,8 @@ elif mode == "📷 Webcam (Live)":
                 cv2.putText(frame, f"{label}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color_bgr, 3)
                 cv2.putText(frame, f"Conf: {conf:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_bgr, 2)
                 
-                with st.sidebar:
-                    st.markdown(f"### État actuel : **{label}**")
-                    st.progress(int(conf * 100))
+                st_status.markdown(f"### État actuel : **{label}**")
+                st_bar.progress(int(conf * 100))
                 
                 FRAME_WINDOW.image(frame, channels="BGR")
         finally:
