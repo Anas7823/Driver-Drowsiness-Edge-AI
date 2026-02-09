@@ -227,27 +227,28 @@ elif mode == "📷 Webcam (Live)":
     if run:
         cap = cv2.VideoCapture(0)
         
-        while run:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("Erreur d'accès à la webcam")
-                break
+        try:
+            while run:
+                ret, frame = cap.read()
+                if not ret:
+                    st.error("Erreur d'accès à la webcam")
+                    break
+                    
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pred_idx, conf, _ = predict_frame(model, frame_rgb, transform)
                 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pred_idx, conf, _ = predict_frame(model, frame_rgb, transform)
-            
-            label = CLASSES[pred_idx]
-            color_bgr = tuple(reversed(COLORS[pred_idx]))
-            
-            cv2.putText(frame, f"{label}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color_bgr, 3)
-            cv2.putText(frame, f"Conf: {conf:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_bgr, 2)
-            
-            with st.sidebar:
-                st.markdown(f"### État actuel : **{label}**")
-                st.progress(int(conf * 100))
-            
-            FRAME_WINDOW.image(frame, channels="BGR")
-        
-        cap.release()
+                label = CLASSES[pred_idx]
+                color_bgr = tuple(reversed(COLORS[pred_idx]))
+                
+                cv2.putText(frame, f"{label}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color_bgr, 3)
+                cv2.putText(frame, f"Conf: {conf:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_bgr, 2)
+                
+                with st.sidebar:
+                    st.markdown(f"### État actuel : **{label}**")
+                    st.progress(int(conf * 100))
+                
+                FRAME_WINDOW.image(frame, channels="BGR")
+        finally:
+            cap.release()
     else:
         st.write("Cochez la case pour démarrer.")
