@@ -35,11 +35,11 @@ class PretrainedVisualEmbedding(nn.Module):
             param.requires_grad = False # Geler les poids pour l'inférence
             
         self.adapter = nn.Sequential(
-            nn.Conv2d(576, output_dim, 1),
+            nn.Conv2d(576, output_dim, 1, bias=False),
             nn.BatchNorm2d(output_dim),
             nn.ReLU6()
         )
-        self.pool = nn.AdaptiveAvgPool2d((8, 8))
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
 
     def forward(self, x):
         x = self.features(x)
@@ -80,7 +80,7 @@ class DriverTRM(nn.Module):
         super().__init__()
         self.config = config
         self.embed_dim = config['embed_dim']
-        self.H = self.W = 8
+        self.H = self.W = 7
         self.embedding = PretrainedVisualEmbedding(self.embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.H*self.W, self.embed_dim))
@@ -108,7 +108,7 @@ class DriverTRM(nn.Module):
 def load_model(model_path):
     try:
         model = DriverTRM(CONFIG)
-        model.load_state_dict(torch.load(model_path, map_location=CONFIG['device']))
+        model.load_state_dict(torch.load(model_path, map_location=CONFIG['device']), strict=False)
         model.to(CONFIG['device'])
         model.eval()
         return model
